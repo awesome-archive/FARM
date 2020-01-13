@@ -5,11 +5,11 @@ import torch
 from farm.data_handler.data_silo import DataSilo
 from farm.data_handler.processor import BertStyleLMProcessor
 from farm.modeling.adaptive_model import AdaptiveModel
-from farm.modeling.language_model import Bert
+from farm.modeling.language_model import LanguageModel
 from farm.modeling.prediction_head import BertLMHead, NextSentenceHead
-from farm.modeling.tokenization import BertTokenizer
+from farm.modeling.tokenization import Tokenizer
 from farm.train import Trainer
-from farm.experiment import initialize_optimizer
+from farm.modeling.optimization import initialize_optimizer
 
 from farm.utils import set_all_seeds, MLFlowLogger, initialize_device_settings
 
@@ -27,28 +27,27 @@ ml_logger.init_experiment(
 ##########################
 ########## Settings
 ##########################
-set_all_seeds(seed=42)
 device, n_gpu = initialize_device_settings(use_cuda=True)
 n_epochs = 1
 batch_size = 32
 evaluate_every = 30
-lang_model = "bert-base-german-cased"
+lang_model = "bert-base-cased"
 
 # 1.Create a tokenizer
-tokenizer = BertTokenizer.from_pretrained(
+tokenizer = Tokenizer.load(
     pretrained_model_name_or_path=lang_model, do_lower_case=False
 )
 
 # 2. Create a DataProcessor that handles all the conversion from raw text into a pytorch Dataset
 processor = BertStyleLMProcessor(
-    data_dir="../data/finetune_sample", tokenizer=tokenizer, max_seq_len=128
+    data_dir="../data/lm_finetune_nips", tokenizer=tokenizer, max_seq_len=128, max_docs=30
 )
 # 3. Create a DataSilo that loads several datasets (train/dev/test), provides DataLoaders for them and calculates a few descriptive statistics of our datasets
-data_silo = DataSilo(processor=processor, batch_size=32)
+data_silo = DataSilo(processor=processor, batch_size=batch_size, max_multiprocessing_chunksize=20)
 
 # 4. Create an AdaptiveModel
 # a) which consists of a pretrained language model as a basis
-language_model = Bert.load(lang_model)
+language_model = LanguageModel.load(lang_model)
 # b) and *two* prediction heads on top that are suited for our task => Language Model finetuning
 lm_prediction_head = BertLMHead.load(lang_model)
 next_sentence_head = NextSentenceHead.load(lang_model)
@@ -62,12 +61,11 @@ model = AdaptiveModel(
 )
 
 # 5. Create an optimizer
-optimizer, warmup_linear = initialize_optimizer(
+model, optimizer, lr_schedule = initialize_optimizer(
     model=model,
     learning_rate=2e-5,
-    warmup_proportion=0.1,
-    n_examples=data_silo.n_samples("train"),
-    batch_size=batch_size,
+    device=device,
+    n_batches=len(data_silo.loaders["train"]),
     n_epochs=n_epochs,
 )
 
@@ -77,15 +75,15 @@ trainer = Trainer(
     data_silo=data_silo,
     epochs=n_epochs,
     n_gpu=n_gpu,
-    warmup_linear=warmup_linear,
-    evaluate_every=5,
+    lr_schedule=lr_schedule,
+    evaluate_every=evaluate_every,
     device=device,
 )
 
-# 7. Let it grow! Watch the tracked metrics live on the public mlflow server: http://80.158.39.167:5000/
+# 7. Let it grow! Watch the tracked metrics live on the public mlflow server: https://public-mlflow.deepset.ai
 model = trainer.train(model)
 
 # 8. Hooray! You have a model. Store it:
-save_dir = "saved_models/bert-german-lm-tutorial"
+save_dir = "saved_models/bert-english-lm-tutorial"
 model.save(save_dir)
 processor.save(save_dir)

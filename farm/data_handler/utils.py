@@ -1,12 +1,15 @@
+import json
 import logging
 import os
-import json
-from requests import get
+import random
 import tarfile
 import tempfile
-from tqdm import tqdm
-import random
+from itertools import islice
+
 import pandas as pd
+from requests import get
+from tqdm import tqdm
+
 from farm.file_utils import http_get
 
 logger = logging.getLogger(__name__)
@@ -19,36 +22,57 @@ DOWNSTREAM_TASK_MAP = {
     "conll03detrain": "https://raw.githubusercontent.com/MaviccPRP/ger_ner_evals/master/corpora/training_data_for_Stanford_NER/NER-de-train-conll-formated.txt",
     "conll03dedev": "https://raw.githubusercontent.com/MaviccPRP/ger_ner_evals/master/corpora/training_data_for_Stanford_NER/NER-de-dev-conll-formated.txt",
     "conll03detest": "https://raw.githubusercontent.com/MaviccPRP/ger_ner_evals/master/corpora/training_data_for_Stanford_NER/NER-de-test-conll-formated.txt",
+    "conll03entrain": "https://raw.githubusercontent.com/synalp/NER/master/corpus/CoNLL-2003/eng.train",
+    "conll03endev": "https://raw.githubusercontent.com/synalp/NER/master/corpus/CoNLL-2003/eng.testa",
+    "conll03entest": "https://raw.githubusercontent.com/synalp/NER/master/corpus/CoNLL-2003/eng.testb",
+    "lm_finetune_nips": "https://s3.eu-central-1.amazonaws.com/deepset.ai-farm-downstream/lm_finetune_nips.tar.gz",
+    "toxic-comments": "https://s3.eu-central-1.amazonaws.com/deepset.ai-farm-downstream/toxic-comments.tar.gz",
+    'cola': "https://s3.eu-central-1.amazonaws.com/deepset.ai-farm-downstream/cola.tar.gz",
 }
 
-
-def read_tsv(filename, quotechar='"', delimiter="\t", skiprows=None, columns=None):
+def read_tsv(filename, rename_columns, quotechar='"', delimiter="\t", skiprows=None, header=0, proxies=None):
     """Reads a tab separated value file. Tries to download the data if filename is not found"""
+
+    # get remote dataset if needed
     if not (os.path.exists(filename)):
-        _download_extract_downstream_data(filename)
+        logger.info(f" Couldn't find {filename} locally. Trying to download ...")
+        _download_extract_downstream_data(filename, proxies=proxies)
+
+    # read file into df
     df = pd.read_csv(
         filename,
         sep=delimiter,
         encoding="utf-8",
         quotechar=quotechar,
-        names=columns,
+        dtype=str,
         skiprows=skiprows,
+        header=header
     )
-    if "unused" in df.columns:
-        df.drop(columns=["unused"], inplace=True)
+
+    # let's rename our target columns to the default names FARM expects:
+    # "text": contains the text
+    # "text_classification_label": contains a label for text classification
+    columns = ["text"] + list(rename_columns.keys())
+    df = df[columns]
+    for source_column, label_name in rename_columns.items():
+        df[label_name] = df[source_column].fillna("")
+        df.drop(columns=[source_column], inplace=True)
+    # convert df to one dict per row
     raw_dict = df.to_dict(orient="records")
     return raw_dict
 
 
-def read_ner_file(filename, sep="\t", **kwargs):
+def read_ner_file(filename, sep="\t", proxies=None):
     """
     read file
     return format :
     [ ['EU', 'B-ORG'], ['rejects', 'O'], ['German', 'B-MISC'], ['call', 'O'], ['to', 'O'], ['boycott', 'O'], ['British', 'B-MISC'], ['lamb', 'O'], ['.', 'O'] ]
     """
     if not (os.path.exists(filename)):
-        _download_extract_downstream_data(filename)
-    f = open(filename)
+        logger.info(f" Couldn't find {filename} locally. Trying to download ...")
+        _download_extract_downstream_data(filename, proxies)
+
+    f = open(filename, encoding='utf-8')
 
     data = []
     sentence = []
@@ -56,7 +80,7 @@ def read_ner_file(filename, sep="\t", **kwargs):
     for line in f:
         if len(line) == 0 or line.startswith("-DOCSTART") or line[0] == "\n":
             if len(sentence) > 0:
-                data.append({"text": " ".join(sentence), "label": label})
+                data.append({"text": " ".join(sentence), "ner_label": label})
                 sentence = []
                 label = []
             continue
@@ -65,20 +89,51 @@ def read_ner_file(filename, sep="\t", **kwargs):
         label.append(splits[-1][:-1])
 
     if len(sentence) > 0:
-        data.append({"text": " ".join(sentence), "label": label})
+        if(label[-1] == ""):
+            logger.error(f"The last NER label: '{splits[-1]}'  in your dataset might have been converted incorrectly. Please insert a newline at the end of the file.")
+            label[-1] = "O"
+        data.append({"text": " ".join(sentence), "ner_label": label})
     return data
 
 
-def read_squad_file(filename):
+def read_squad_file(filename, proxies=None):
     """Read a SQuAD json file"""
     if not (os.path.exists(filename)):
-        _download_extract_downstream_data(filename)
+        logger.info(f" Couldn't find {filename} locally. Trying to download ...")
+        _download_extract_downstream_data(filename, proxies)
     with open(filename, "r", encoding="utf-8") as reader:
         input_data = json.load(reader)["data"]
     return input_data
 
+def write_squad_predictions(predictions, out_filename, predictions_filename=None):
+    predictions_json = {}
+    for p in predictions:
+        for x in p["predictions"]:
+            predictions_json[x["question_id"]] = x["answers"][0]["answer"]
 
-def _download_extract_downstream_data(input_file):
+    if predictions_filename:
+        dev_labels = {}
+        temp = json.load(open(predictions_filename, "r"))
+        for d in temp["data"]:
+            for p in d["paragraphs"]:
+                for q in p["qas"]:
+                    if q["is_impossible"]:
+                        dev_labels[q["id"]] = "is_impossible"
+                    else:
+                        dev_labels[q["id"]] = q["answers"][0]["text"]
+        not_included = set(list(dev_labels.keys())) - set(list(predictions_json.keys()))
+        if len(not_included) > 0:
+            logger.info(f"There were missing predicitons for question ids: {str(set(list(dev_labels.keys())))}")
+        for x in not_included:
+            predictions_json[x] = ""
+
+    os.makedirs("model_output", exist_ok=True)
+    filepath = os.path.join("model_output",out_filename)
+    json.dump(predictions_json, open(filepath, "w"))
+    logger.info(f"Written Squad predictions to: {filepath}")
+
+
+def _download_extract_downstream_data(input_file, proxies=None):
     # download archive to temp dir and extract to correct position
     full_path = os.path.realpath(input_file)
     directory = os.path.dirname(full_path)
@@ -87,17 +142,22 @@ def _download_extract_downstream_data(input_file):
     logger.info(
         "downloading and extracting file {} to dir {}".format(taskname, datadir)
     )
-    if "conll03" in taskname and "de" in taskname:
+    if "conll03" in taskname:
         # conll03 is copyrighted, but luckily somebody put it on github. Kudos!
         if not os.path.exists(directory):
             os.makedirs(directory)
         for dataset in ["train", "dev", "test"]:
-            _conll03get(dataset, directory)
+            if "de" in taskname:
+                _conll03get(dataset, directory, "de")
+            elif "en" in taskname:
+                _conll03get(dataset, directory, "en")
+            else:
+                logger.error("Cannot download {}. Unknown data source.".format(taskname))
     elif taskname not in DOWNSTREAM_TASK_MAP:
         logger.error("Cannot download {}. Unknown data source.".format(taskname))
     else:
         with tempfile.NamedTemporaryFile() as temp_file:
-            http_get(DOWNSTREAM_TASK_MAP[taskname], temp_file)
+            http_get(DOWNSTREAM_TASK_MAP[taskname], temp_file, proxies=proxies)
             temp_file.flush()
             temp_file.seek(0)  # making tempfile accessible
             tfile = tarfile.open(temp_file.name)
@@ -105,91 +165,65 @@ def _download_extract_downstream_data(input_file):
         # temp_file gets deleted here
 
 
-def _conll03get(dataset, directory):
+def _conll03get(dataset, directory, language):
     # open in binary mode
     with open(os.path.join(directory, f"{dataset}.txt"), "wb") as file:
         # get request
-        response = get(DOWNSTREAM_TASK_MAP[f"conll03de{dataset}"])
+        response = get(DOWNSTREAM_TASK_MAP[f"conll03{language}{dataset}"])
         # write to file
         file.write(response.content)
 
 
-def read_docs_from_txt(filename, delimiter="", encoding="utf-8"):
+def read_docs_from_txt(filename, delimiter="", encoding="utf-8", max_docs=None, proxies=None):
     """Reads a text file with one sentence per line and a delimiter between docs (default: empty lines) ."""
+    if not (os.path.exists(filename)):
+        _download_extract_downstream_data(filename, proxies)
     all_docs = []
     doc = []
     corpus_lines = 0
-    # sample_to_doc = []
     with open(filename, "r", encoding=encoding) as f:
-        for line in tqdm(f, desc="Loading Dataset", total=corpus_lines):
+        for line_num, line in enumerate(tqdm(f, desc="Loading Dataset", total=corpus_lines)):
             line = line.strip()
             if line == delimiter:
-                all_docs.append({"doc": doc})
-                doc = []
-                # # remove last added sample because there won't be a subsequent line anymore in the doc
-                # sample_to_doc.pop()
+                if len(doc) > 0:
+                    all_docs.append({"doc": doc})
+                    doc = []
+                    if max_docs:
+                        if len(all_docs) >= max_docs:
+                            logger.info(f"Reached number of max_docs ({max_docs}). Skipping rest of file ...")
+                            break
+                else:
+                    logger.warning(f"Found empty document in file (line {line_num}). "
+                                   f"Make sure that you comply with the format: "
+                                   f"One sentence per line and exactly *one* empty line between docs. "
+                                   f"You might have multiple subsequent empty lines.")
             else:
-                # store as one sample
-                # sample = {"doc_id": len(all_docs), "line": len(doc)}
-                # sample_to_doc.append(sample)
                 doc.append(line)
-                # corpus_lines = corpus_lines + 1
 
-        # if last row in file is not empty
-        if all_docs[-1] != doc:
-            all_docs.append({"doc": doc})
-            # sample_to_doc.pop()
+        # if last row in file is not empty, we add the last parsed doc manually to all_docs
+        if len(doc) > 0:
+            if len(all_docs) > 0:
+                if all_docs[-1] != doc:
+                    all_docs.append({"doc": doc})
+            else:
+                all_docs.append({"doc": doc})
 
-    # data = (all_docs, sample_to_doc)
+        if len(all_docs) < 2:
+            raise ValueError(f"Found only {len(all_docs)} docs in {filename}). You need at least 2! \n"
+                           f"Make sure that you comply with the format: \n"
+                           f"-> One sentence per line and exactly *one* empty line between docs. \n"
+                           f"You might have a single block of text without empty lines inbetween.")
     return all_docs
 
 
-def print_example_with_features(
-    example, tokens, input_ids, padding_mask, segment_ids, label_ids, initial_mask
-):
-    logger.info("*** Example ***")
-    logger.info("guid: %s" % (example.guid))
-    logger.info("tokens: %s" % " ".join([str(x) for x in tokens]))
-    logger.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
-    logger.info("padding_mask: %s" % " ".join([str(x) for x in padding_mask]))
-    logger.info("segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
-    logger.info("label: %s" % (example.label))
-    logger.info("ids  : %s" % (label_ids))
-    logger.info("initial_mask: %s" % (initial_mask))
-
-
-def truncate_seq_pair(tokens_a, tokens_b, max_length):
-    """Truncates a sequence pair in place to the maximum length."""
-
-    # This is a simple heuristic which will always truncate the longer sequence
-    # one token at a time. This makes more sense than truncating an equal percent
-    # of tokens from each, since if one sequence is very short then each token
-    # that's truncated likely contains more information than a longer sequence.
-    while True:
-        total_length = len(tokens_a) + len(tokens_b)
-        if total_length <= max_length:
-            break
-        if len(tokens_a) > len(tokens_b):
-            tokens_a.pop()
-        else:
-            tokens_b.pop()
-
-
-def add_cls_sep(seq, cls_token, sep_token):
-    # Inference mode
-    if not seq:
-        return None
-    ret = [cls_token]
-    ret += seq
-    ret += [sep_token]
-    return ret
-
-
-def pad(seq, max_seq_len, pad_token):
+def pad(seq, max_seq_len, pad_token, pad_on_left=False):
     ret = seq
     n_required_pad = max_seq_len - len(seq)
     for _ in range(n_required_pad):
-        ret.append(pad_token)
+        if pad_on_left:
+            ret.insert(0, pad_token)
+        else:
+            ret.append(pad_token)
     return ret
 
 
@@ -212,19 +246,23 @@ def expand_labels(labels_word, initial_mask, non_initial_token):
     return labels_token
 
 
-def get_sentence_pair(doc, all_docs, idx):
+def get_sentence_pair(doc, all_baskets, idx, prob_next_sentence=0.5):
     """
     Get one sample from corpus consisting of two sentences. With prob. 50% these are two subsequent sentences
     from one doc. With 50% the second sentence will be a random one from another doc.
+
+    :param doc: The current document
+    :param all_baskets: SampleBaskets containing multiple other docs from which we can sample the second sentence
+    if we need a random one.
     :param idx: int, index of sample.
     :return: (str, str, int), sentence 1, sentence 2, isNextSentence Label
     """
     sent_1, sent_2 = doc[idx], doc[idx + 1]
 
-    if random.random() > 0.5:
+    if random.random() > prob_next_sentence:
         label = True
     else:
-        sent_2 = _get_random_sentence(all_docs, forbidden_doc=doc)
+        sent_2 = _get_random_sentence(all_baskets, forbidden_doc=doc)
         label = False
 
     assert len(sent_1) > 0
@@ -232,62 +270,109 @@ def get_sentence_pair(doc, all_docs, idx):
     return sent_1, sent_2, label
 
 
-def _get_random_sentence(docs, forbidden_doc):
+def _get_random_sentence(all_baskets, forbidden_doc):
     """
     Get random line from another document for nextSentence task.
+
     :return: str, content of one line
     """
     # Similar to original BERT tf repo: This outer loop should rarely go for more than one iteration for large
     # corpora. However, just to be careful, we try to make sure that
     # the random document is not the same as the document we're processing.
-    for _ in range(10):
-        rand_doc_idx = random.randint(0, len(docs) - 1)
-        rand_doc = docs[rand_doc_idx]
+    sentence = None
+    for _ in range(100):
+        rand_doc_idx = random.randrange(len(all_baskets))
+        rand_doc = all_baskets[rand_doc_idx]["doc"]
 
         # check if our picked random doc is really different to our initial doc
         if rand_doc != forbidden_doc:
-            sentence = rand_doc[random.randrange(len(rand_doc))]
+            rand_sent_idx = random.randrange(len(rand_doc))
+            sentence = rand_doc[rand_sent_idx]
             break
+    if sentence is None:
+        raise Exception("Failed to pick out a suitable random substitute for next sentence")
     return sentence
 
 
-def mask_random_words(tokens, tokenizer):
+def mask_random_words(tokens, vocab, token_groups=None, max_predictions_per_seq=20, masked_lm_prob=0.15):
     """
     Masking some random tokens for Language Model task with probabilities as in the original BERT paper.
-    :param tokens: list of str, tokenized sentence.
-    :param tokenizer: Tokenizer, object used for tokenization (we need it's vocab here)
+    num_masked. If whole_word_mask is set to true, *all* tokens of a word are either masked or not.
+    This option was added by the BERT authors later and showed solid improvements compared to the original objective.
+    Whole Word Masking means that if we mask all of the wordpieces corresponding to an original word.
+    When a word has been split intoWordPieces, the first token does not have any marker and any subsequence
+    tokens are prefixed with ##. So whenever we see the ## token, we
+    append it to the previous set of word indexes. Note that Whole Word Masking does *not* change the training code
+    at all -- we still predict each WordPiece independently, softmaxed over the entire vocabulary.
+    This implementation is mainly a copy from the original code by Google, but includes some simplifications.
+
+    :param tokens: tokenized sentence.
+    :type tokens: [str]
+    :param vocab: vocabulary for choosing tokens for random masking.
+    :type vocab: dict
+    :param token_groups: If supplied, only whole groups of tokens get masked. This can be whole words but
+    also other types (e.g. spans). Booleans indicate the start of a group.
+    :type token_groups: [bool]
+    :param max_predictions_per_seq: maximum number of masked tokens
+    :type max_predictions_per_seq: int
+    :param masked_lm_prob: probability of masking a token
+    :type masked_lm_prob: float
     :return: (list of str, list of int), masked tokens and related labels for LM prediction
     """
-    output_label = []
 
-    for i, token in enumerate(tokens):
-        prob = random.random()
-        # mask token with 15% probability
-        if prob < 0.15:
-            prob /= 0.15
+    #TODO make special tokens model independent
 
+    # 1. Combine tokens to one group (e.g. all subtokens of a word)
+    cand_indices = []
+    for (i, token) in enumerate(tokens):
+        if token == "[CLS]" or token == "[SEP]":
+            continue
+        if (token_groups and len(cand_indices) >= 1 and not token_groups[i]):
+            cand_indices[-1].append(i)
+        else:
+            cand_indices.append([i])
+
+    num_to_mask = min(max_predictions_per_seq,
+                      max(1, int(round(len(tokens) * masked_lm_prob))))
+
+    random.shuffle(cand_indices)
+    output_label = [''] * len(tokens)
+    num_masked = 0
+    assert "[MASK]" not in tokens
+
+    # 2. Mask the first groups until we reach the number of tokens we wanted to mask (num_to_mask)
+    for index_set in cand_indices:
+        if num_masked >= num_to_mask:
+            break
+        # If adding a whole-word mask would exceed the maximum number of
+        # predictions, then just skip this candidate.
+        if num_masked + len(index_set) > num_to_mask:
+            continue
+
+        for index in index_set:
+            prob = random.random()
+            num_masked += 1
+            original_token = tokens[index]
             # 80% randomly change token to mask token
             if prob < 0.8:
-                tokens[i] = "[MASK]"
+                tokens[index] = "[MASK]"
 
             # 10% randomly change token to random token
+            #TODO currently custom vocab is not included here
             elif prob < 0.9:
-                tokens[i] = random.choice(list(tokenizer.vocab.items()))[0]
+                tokens[index] = random.choice(list(vocab.items()))[0]
 
             # -> rest 10% randomly keep current token
 
             # append current token to output (we will predict these later)
             try:
-                output_label.append(tokenizer.vocab[token])
+                output_label[index] = original_token
             except KeyError:
                 # For unknown words (should not occur with BPE vocab)
-                output_label.append(tokenizer.vocab["[UNK]"])
+                output_label[index] = "[UNK]"
                 logger.warning(
-                    "Cannot find token '{}' in vocab. Using [UNK] insetad".format(token)
+                    "Cannot find token '{}' in vocab. Using [UNK] instead".format(original_token)
                 )
-        else:
-            # no masking token (will be ignored by loss function later)
-            output_label.append(-1)
 
     return tokens, output_label
 
@@ -298,3 +383,11 @@ def is_json(x):
         return True
     except:
         return False
+
+def grouper(iterable, n):
+    """
+    >>> list(grouper('ABCDEFG', 3))
+    [[(0, 'A'), (1, 'B'), (2, 'C')], [(3, 'D'), (4, 'E'), (5, 'F')], [(6, 'G')]]
+    """
+    iterable = iter(enumerate(iterable))
+    return iter(lambda: list(islice(iterable, n)), [])

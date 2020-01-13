@@ -3,7 +3,6 @@ import os
 
 from torch import nn
 
-from farm.file_utils import create_folder
 from farm.modeling.language_model import LanguageModel
 from farm.modeling.prediction_head import PredictionHead, BertLMHead
 from farm.utils import MLFlowLogger as MlLogger
@@ -21,7 +20,7 @@ class AdaptiveModel(nn.Module):
         prediction_heads,
         embeds_dropout_prob,
         lm_output_types,
-        device,
+        device
     ):
         """
         :param language_model: Any model that turns token ids into vector representations
@@ -62,14 +61,14 @@ class AdaptiveModel(nn.Module):
         :param save_dir: path to save to
         :type save_dir: str
         """
-        create_folder(save_dir)
+        os.makedirs(save_dir, exist_ok=True)
         self.language_model.save(save_dir)
         for i, ph in enumerate(self.prediction_heads):
             ph.save(save_dir, i)
             # Need to save config and pipeline
 
     @classmethod
-    def load(cls, load_dir, device):
+    def load(cls, load_dir, device, strict=True, lm_name=None):
         """
         Loads an AdaptiveModel from a directory. The directory must contain:
 
@@ -84,20 +83,26 @@ class AdaptiveModel(nn.Module):
         :type load_dir: str
         :param device: to which device we want to sent the model, either cpu or cuda
         :type device: torch.device
+        :param lm_name: the name to assign to the loaded language model
+        :type lm_name: str
+        :param strict: whether to strictly enforce that the keys loaded from saved model match the ones in
+                       the PredictionHead (see torch.nn.module.load_state_dict()).
+                       Set to `False` for backwards compatibility with PHs saved with older version of FARM.
+        :type strict: bool
         """
 
         # Language Model
-        language_model = LanguageModel.load(load_dir)
+        language_model = LanguageModel.load(load_dir, farm_lm_name=lm_name)
 
         # Prediction heads
         _, ph_config_files = cls._get_prediction_head_files(load_dir)
         prediction_heads = []
         ph_output_type = []
         for config_file in ph_config_files:
-            head = PredictionHead.load(config_file)
-            # set shared weights between LM and PH
-            if type(head) == BertLMHead:
-                head.set_shared_weights(language_model)
+            head = PredictionHead.load(config_file, strict=strict)
+            # # set shared weights between LM and PH
+            # if type(head) == BertLMHead:
+            #     head.set_shared_weights(language_model)
             prediction_heads.append(head)
             ph_output_type.append(head.ph_output_type)
 
@@ -128,10 +133,13 @@ class AdaptiveModel(nn.Module):
         :return loss: torch.tensor that is the per sample loss (len: batch_size)
         """
         all_losses = self.logits_to_loss_per_head(logits, **kwargs)
+        # this sums up loss per sample across multiple prediction heads
+        # TODO, check if we should take mean here.
+        # Otherwise we have to scale the learning rate in relation to how many Prediction Heads we have
         loss = sum(all_losses)
         return loss
 
-    def logits_to_preds(self, logits, label_maps, **kwargs):
+    def logits_to_preds(self, logits, **kwargs):
         """
         Get predictions from all prediction heads.
 
@@ -143,16 +151,12 @@ class AdaptiveModel(nn.Module):
         """
         all_preds = []
         # collect preds from all heads
-        for head, logits_for_head, label_map_for_head in zip(
-            self.prediction_heads, logits, label_maps
-        ):
-            preds = head.logits_to_preds(
-                logits=logits_for_head, label_map=label_map_for_head, **kwargs
-            )
+        for head, logits_for_head in zip(self.prediction_heads, logits):
+            preds = head.logits_to_preds(logits=logits_for_head, **kwargs)
             all_preds.append(preds)
         return all_preds
 
-    def prepare_labels(self, label_maps, **kwargs):
+    def prepare_labels(self, **kwargs):
         """
         Label conversion to original label space, per prediction head.
 
@@ -161,12 +165,15 @@ class AdaptiveModel(nn.Module):
         :return: labels in the right format
         """
         all_labels = []
-        for head, label_map_one_head in zip(self.prediction_heads, label_maps):
-            labels = head.prepare_labels(label_map=label_map_one_head, **kwargs)
+        # for head, label_map_one_head in zip(self.prediction_heads):
+        #     labels = head.prepare_labels(label_map=label_map_one_head, **kwargs)
+        #     all_labels.append(labels)
+        for head in self.prediction_heads:
+            labels = head.prepare_labels(**kwargs)
             all_labels.append(labels)
         return all_labels
 
-    def formatted_preds(self, logits, label_maps, **kwargs):
+    def formatted_preds(self, logits, **kwargs):
         """
         Format predictions for inference.
 
@@ -180,11 +187,11 @@ class AdaptiveModel(nn.Module):
         """
         all_preds = []
         # collect preds from all heads
-        for head, logits_for_head, label_map_for_head in zip(
-            self.prediction_heads, logits, label_maps
+        for head, logits_for_head in zip(
+            self.prediction_heads, logits
         ):
             preds = head.formatted_preds(
-                logits=logits_for_head, label_map=label_map_for_head, **kwargs
+                logits=logits_for_head, **kwargs
             )
             all_preds.append(preds)
         return all_preds
@@ -208,7 +215,7 @@ class AdaptiveModel(nn.Module):
             # Choose relevant vectors from LM as output and perform dropout
             if lm_out == "per_token":
                 output = self.dropout(sequence_output)
-            elif lm_out == "per_sequence":
+            elif lm_out == "per_sequence" or lm_out == "per_sequence_continuous":
                 output = self.dropout(pooled_output)
             elif (
                 lm_out == "per_token_squad"
@@ -223,6 +230,22 @@ class AdaptiveModel(nn.Module):
             all_logits.append(head(output))
 
         return all_logits
+
+    def connect_heads_with_processor(self, tasks, require_labels=True):
+        """
+        Populates prediction head with information coming from tasks.
+
+        :param tasks: A dictionary where the keys are the names of the tasks and the values are the details of the task (e.g. label_list, metric, tensor name)
+        :param require_labels: If True, an error will be thrown when a task is not supplied with labels)
+        :return:
+        """
+        for head in self.prediction_heads:
+            head.label_tensor_name = tasks[head.task_name]["label_tensor_name"]
+            label_list = tasks[head.task_name]["label_list"]
+            if not label_list and require_labels:
+                raise Exception(f"The task \'{head.task_name}\' is missing a valid set of labels")
+            head.label_list = tasks[head.task_name]["label_list"]
+            head.metric = tasks[head.task_name]["metric"]
 
     @classmethod
     def _get_prediction_head_files(cls, load_dir):
@@ -256,7 +279,8 @@ class AdaptiveModel(nn.Module):
         Logs paramteres to generic logger MlLogger
         """
         params = {
-            "lm": self.language_model.__class__.__name__,
+            "lm_type": self.language_model.__class__.__name__,
+            "lm_name": self.language_model.name,
             "prediction_heads": ",".join(
                 [head.__class__.__name__ for head in self.prediction_heads]
             ),
@@ -266,3 +290,19 @@ class AdaptiveModel(nn.Module):
             MlLogger.log_params(params)
         except Exception as e:
             logger.warning(f"ML logging didn't work: {e}")
+
+    def verify_vocab_size(self, vocab_size):
+        """ Verifies that the model fits to the tokenizer vocabulary.
+        They could diverge in case of custom vocabulary added via tokenizer.add_tokens()"""
+
+        model_vocab_len = self.language_model.model.resize_token_embeddings(new_num_tokens=None).num_embeddings
+
+        msg = f"Vocab size of tokenizer {vocab_size} doesn't match with model {model_vocab_len}. " \
+              "If you added a custom vocabulary to the tokenizer, " \
+              "make sure to supply 'n_added_tokens' to LanguageModel.load() and BertStyleLM.load()"
+        assert vocab_size == model_vocab_len, msg
+
+        for head in self.prediction_heads:
+            if head.model_type == "language_modelling":
+                ph_decoder_len = head.decoder.weight.shape[0]
+                assert vocab_size == ph_decoder_len, msg

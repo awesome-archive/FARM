@@ -9,7 +9,7 @@ Document Classification
 
 1.Create a tokenizer::
 
-    tokenizer = BertTokenizer.from_pretrained(
+    tokenizer = Tokenizer.load(
         pretrained_model_name_or_path=lang_model,
         do_lower_case=False)
 
@@ -28,7 +28,7 @@ Document Classification
 4. Create an AdaptiveModel
 a) which consists of a pretrained language model as a basis::
 
-    language_model = Bert.load(lang_model)
+    language_model = LanguageModel.load(lang_model)
 
 b) and a prediction head on top that is suited for our task => Text classification::
 
@@ -41,9 +41,9 @@ b) and a prediction head on top that is suited for our task => Text classificati
         lm_output_types=["per_sequence"],
         device=device)
 
-5. Create an optimizer::
+5. Create an optimizer and optionally optimize model and optimizer with AMP::
 
-    optimizer, warmup_linear = initialize_optimizer(
+    model, optimizer, warmup_linear = initialize_optimizer(
         model=model,
         learning_rate=2e-5,
         warmup_proportion=0.1,
@@ -79,5 +79,5 @@ b) and a prediction head on top that is suited for our task => Text classificati
         {"text": "Martin Müller spielt Fussball"},
     ]
     model = Inferencer(save_dir)
-    result = model.run_inference(dicts=basic_texts)
+    result = model.inference_from_dicts(dicts=basic_texts)
     print(result)

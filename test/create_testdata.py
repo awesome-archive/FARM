@@ -13,7 +13,7 @@ def squad_subsample():
     with open('../data/squad20/dev-v2.0.json') as json_file:
         data = json.load(json_file)
 
-    ss = data["data"][0]["paragraphs"][:3]
+    ss = data["data"][0]["paragraphs"][:1]
     sample = {}
     sample["data"] = [{"paragraphs": ss}]
     # just creating same train and dev files
